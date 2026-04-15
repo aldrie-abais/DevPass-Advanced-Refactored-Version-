@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useQRCode } from '../../hooks/useQRCode';
 import { authService } from '../../services/authService';
 import api from '../../api/axios';
