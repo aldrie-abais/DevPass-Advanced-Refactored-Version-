@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Device;
 use App\Models\Student;
 use App\Models\EntryLog;
+use App\Models\DashboardStat;
 use App\Services\QRCodeService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -19,151 +20,53 @@ class DeviceController extends Controller
         $this->qrCodeService = $qrCodeService;
     }
 
-    /**
-     * Get all devices with student information (for admin) or student's own devices (for students)
-     */
-    public function index(Request $request)
-    {
-        $status = $request->query('status'); // pending, active, all
-        $user = $request->user();
-        
-        // Ensure relationships are correctly defined in the Device model:
-        // 'student' -> belongs to Student::class
-        // 'admin' -> belongs to Admin::class (using 'approved_by' column)
-        // 'qrCodes' -> hasMany QrCode::class
-        // Eager load all relationships to prevent N+1 queries
-        // Optimize: Load only active QR codes, latest first
-        $query = Device::with([
-            'student', 
-            'admin', 
-            'qrCodes' => function($q) {
-                $q->where('is_active', true)->latest('expires_at');
-            }
-        ]);
-        
-        // --- Admin/Student Authorization Logic ---
-        $isAdmin = false;
-        if ($user) {
-            // NOTE: The logic below assumes the authenticated user is an instance of Student model
-            // or has access to 'course' and 'email' properties for role detection.
-            if (isset($user->course)) {
-                $isAdmin = strtolower($user->course) === 'admin';
-            }
-            if (!$isAdmin && isset($user->email)) {
-                $isAdmin = str_contains(strtolower($user->email), 'admin@devpass');
-            }
-            
-            // If not admin, filter by student_id
-            if (!$isAdmin) {
-                $query->where('student_id', $user->student_id ?? $user->id); // Support both for backward compatibility
-            }
+    // --- In app/Http/Controllers/DeviceController.php ---
+
+// Make sure to add this at the top of your controller:
+// use App\Models\DashboardStat;
+
+/* 
+The "Instructor Flex"
+When you present this, point out the raw SQL inside your migration. You can explain that you utilized LEFT JOIN operators to combine tables, a correlated subquery in the SELECT clause to fetch the latest entry log, and MySQL's built-in date functions (DATE_FORMAT) to handle string formatting right at the database layer.
+
+Go ahead and run the migration and check if your React dashboard still loads the data correctly. Let me know when you are ready to tackle Module B (The automated scan counting trigger)!
+*/
+
+public function index(Request $request)
+{
+    $status = $request->query('status'); // pending, active, all
+    $user = $request->user();
+    
+    // We start our query using the new View Model!
+    $query = DashboardStat::query();
+    
+    // --- Admin/Student Authorization Logic ---
+    $isAdmin = false;
+    if ($user) {
+        if (isset($user->course)) {
+            $isAdmin = strtolower($user->course) === 'admin';
+        }
+        if (!$isAdmin && isset($user->email)) {
+            $isAdmin = str_contains(strtolower($user->email), 'admin@devpass');
         }
         
-        // For students, include rejected and soft-deleted devices when status is 'all' or not specified
-        // This ensures devices that have been scanned (even if rejected/deleted) appear in the list
-        // IMPORTANT: Always include devices with recent 'reverted' last_action so notifications work
-        if (!$isAdmin && (!$status || $status === 'all')) {
-            $query->withTrashed(); // Include soft-deleted devices
+        // If not admin, filter the view by studentId
+        if (!$isAdmin) {
+            $query->where('studentId', $user->id);
         }
-        
-        // --- Status Filtering ---
-        if ($status && $status !== 'all') {
-            $query->where('registration_status', $status);
-            // Note: Devices with 'reverted' last_action have status='active', so they're already included
-        } else if (!$isAdmin) {
-            // For students with 'all' filter, show all statuses including rejected
-            // Don't filter by status, just show everything
-            // This ensures devices with 'reverted' last_action are always visible
-        }
-        
-        // Add pagination to prevent loading all devices at once (CRITICAL for performance)
-        $perPage = $request->query('per_page', 20); // Default 20 per page, max 100
-        $perPage = min(max((int)$perPage, 1), 100); // Enforce limits: 1-100
-        
-        $devices = $query->orderBy('registration_date', 'desc')->paginate($perPage);
-        
-        // Get all QR code hashes for batch querying entry logs (optimized with collection methods)
-        $qrHashes = $devices->getCollection()->flatMap(function($device) {
-            return $device->qrCodes->pluck('qr_code_hash')->filter();
-        })->unique()->values()->toArray();
-        
-        // Batch load entry logs to prevent N+1 queries
-        $entryLogs = [];
-        if (!empty($qrHashes)) {
-            $entries = EntryLog::whereIn('qr_code_hash', $qrHashes)
-                ->where('status', 'success')
-                ->orderBy('scan_timestamp', 'desc')
-                ->get()
-                ->groupBy('qr_code_hash');
-            
-            // Get the latest entry for each QR code
-            foreach ($entries as $hash => $logs) {
-                $entryLogs[$hash] = $logs->first();
-            }
-        }
-        
-        // Format response for frontend
-        $formatted = $devices->getCollection()->map(function ($device) use ($entryLogs) {
-            // Use the correct primary key name: 'laptop_id'
-            $idKey = 'laptop_id';
-            
-            // Get latest active QR code from eager loaded relationship
-            $latestQR = null;
-            if ($device->qrCodes && $device->qrCodes->isNotEmpty()) {
-                // Filter for active QR codes and get the latest by expires_at
-                $activeQRCodes = $device->qrCodes->where('is_active', true);
-                if ($activeQRCodes->isNotEmpty()) {
-                    $latestQR = $activeQRCodes->sortByDesc('expires_at')->first();
-                }
-            }
-            
-            // Get last scanned timestamp from pre-loaded entry logs
-            $lastScanned = null;
-            if ($latestQR && isset($entryLogs[$latestQR->qr_code_hash])) {
-                $lastEntry = $entryLogs[$latestQR->qr_code_hash];
-                if ($lastEntry && $lastEntry->scan_timestamp) {
-                    $lastScanned = $lastEntry->scan_timestamp->setTimezone(config('app.timezone'))->format('M d, Y h:i A');
-                }
-            }
-            
-            // Check if device has pending changes (was previously approved but now pending)
-            // A device has pending changes if it's pending but has an approved_at timestamp (was approved before)
-            $hasPendingChanges = $device->registration_status === 'pending' && 
-                                 $device->approved_at !== null;
-            
-            return [
-                // CHANGED: Primary key is 'laptop_id' in your schema
-                'id' => $device->$idKey, 
-                'studentName' => $device->student->name ?? 'Unknown',
-                'studentId' => $device->student->student_id ?? $device->student->id ?? 'N/A',
-                'course' => $device->student->course ?? 'N/A',
-                // REMOVED 'type' as it's not in the schema, using 'model'/'brand' instead
-                'brand' => $device->brand,
-                'model' => $device->model,
-                'serialNumber' => $device->serial_number,
-                'status' => $device->deleted_at ? 'deleted' : $device->registration_status, // Show 'deleted' if soft-deleted
-                'isDeleted' => $device->deleted_at !== null, // Flag to identify deleted devices
-                'registrationDate' => $device->registration_date ? $device->registration_date->setTimezone(config('app.timezone'))->format('Y-m-d') : null,
-                'qrExpiry' => $latestQR && $latestQR->expires_at ? $latestQR->expires_at->setTimezone(config('app.timezone'))->format('Y-m-d') : null,
-                'qrCodeHash' => $latestQR ? $latestQR->qr_code_hash : null,
-                'lastScanned' => $lastScanned,
-                'hasPendingChanges' => $hasPendingChanges, // Flag to indicate edited device waiting for approval
-                'lastAction' => $device->last_action, // Track last action for notifications
-                'approvedAt' => $device->approved_at ? $device->approved_at->setTimezone(config('app.timezone'))->format('Y-m-d H:i:s') : null, // Include approved_at for unique notification keys
-            ];
-        });
-        
-        // Return paginated response with metadata
-        return response()->json([
-            'data' => $formatted,
-            'current_page' => $devices->currentPage(),
-            'per_page' => $devices->perPage(),
-            'total' => $devices->total(),
-            'last_page' => $devices->lastPage(),
-            'from' => $devices->firstItem(),
-            'to' => $devices->lastItem(),
-        ]);
     }
+    
+    // --- Status Filtering ---
+    if ($status && $status !== 'all') {
+        $query->where('status', $status);
+    }
+    
+    // Fetch the data and return it directly. 
+    // No more PHP mapping required! The database did all the formatting.
+    $devices = $query->orderBy('registrationDate', 'desc')->get();
+    
+    return response()->json($devices);
+}
 
     /**
      * Get device statistics
@@ -261,94 +164,134 @@ class DeviceController extends Controller
         return response()->json($history);
     }
 
-    /**
-     * Approve a device
-     */
-    public function approve($id)
-    {
-        // CHANGED: Use 'laptop_id' for findOrFail if that is the model's primary key
-        $device = Device::findOrFail($id); 
-        $user = Auth::user();
-        
-        // --- Admin Check ---
-        $isAdmin = false;
-        if (isset($user->course)) {
-            $isAdmin = strtolower($user->course) === 'admin';
-        }
-        if (!$isAdmin && isset($user->email)) {
-            $isAdmin = str_contains(strtolower($user->email), 'admin@devpass');
-        }
-        
-        if (!$isAdmin) {
-            return response()->json(['message' => 'Unauthorized. Admin access required.'], 403);
-        }
-        
-        // Get admin ID from admins table
-        // NOTE: This logic assumes the authenticated $user object (Student model) has an 'email'
-        // and that an Admin record exists with that email and has an 'admin_id' primary key.
-        $adminId = null;
-        if (isset($user->email)) {
-            $admin = \App\Models\Admin::where('email', $user->email)->first();
-            if ($admin) {
-                $adminId = $admin->admin_id; // Match the foreign key 'approved_by' in devices table
-            }
-        }
-        
-        // Fallback or error handling if adminId is not found might be needed here
-        // For simplicity, we proceed with potentially null if user isn't found in Admin model
-        
-        // Check if this is a renewal request
-        $isRenewalRequest = $device->last_action === 'renewal_requested';
-        
-        if ($isRenewalRequest) {
-            // Handle renewal approval
-            return $this->approveRenewal($id);
-        }
-        
-        // Check if this is an edited device (has original_values and approved_at)
-        $isEditedDevice = $device->original_values !== null && $device->approved_at !== null;
-        
-        $device->registration_status = 'active';
-        $device->approved_by = $adminId;
-        $device->approved_at = Carbon::now(config('app.timezone'));
-        
-        // Clear original values since changes are now approved
-        $device->original_values = null;
-        $device->last_action = $isEditedDevice ? 'changes_approved' : 'approved';
-        $device->save();
-        
-        // Create QR code for the device (or reactivate existing if it's an edited device)
-        if ($isEditedDevice) {
-            // For edited devices, reactivate the latest QR code if it exists and is not expired
-            $latestQR = $device->qrCodes()->latest('expires_at')->first();
-            if ($latestQR && $latestQR->expires_at && $latestQR->expires_at->isFuture()) {
-                $latestQR->is_active = true;
-                $latestQR->save();
-                $qrCode = $latestQR;
-            } else {
-                // Create new QR code if none exists or all are expired
-                $qrCode = $this->qrCodeService->createQRCode([
-                    'laptop_id' => $device->laptop_id, 
-                    'expires_at' => Carbon::now(config('app.timezone'))->addMonth(),
-                    'is_active' => true,
-                ]);
-            }
-        } else {
-            // New device - create new QR code
-            $qrCode = $this->qrCodeService->createQRCode([
-                'laptop_id' => $device->laptop_id, 
-                    'expires_at' => Carbon::now(config('app.timezone'))->addMonth(),
-                'is_active' => true,
-            ]);
-        }
+    public function approve(Request $request, $id)
+{
+    // 1. Get the admin making the request
+    $admin = $request->user();
+    
+    // Ensure we are getting the correct primary key for the admin
+    $adminId = $admin->admin_id ?? $admin->getKey();
+
+    // 2. Prepare the data for the Stored Procedure
+    // Generate a secure, unique hash for the new QR code
+    $qrHash = hash('sha256', $id . time() . Str::random(16));
+    
+    // Set an expiration date (e.g., 1 year from now)
+    $expiresAt = Carbon::now(config('app.timezone'))->addYear();
+
+    try {
+        // 3. THE ADVANCED MYSQL CALL
+        // We pass the parameters directly into the Stored Procedure
+        DB::statement('CALL PRC_APPROVE_DEVICE(?, ?, ?, ?)', [
+            $id,
+            $adminId,
+            $qrHash,
+            $expiresAt
+        ]);
+
+        return response()->json([
+            'message' => 'Device approved and QR code generated successfully.',
+            'qr_code_hash' => $qrHash
+        ], 200);
+
+    } catch (\Illuminate\Database\QueryException $e) {
+        \Log::error('Stored Procedure Error (Approve Device): ' . $e->getMessage());
         
         return response()->json([
-            'message' => 'Device approved successfully',
-            'device' => $device->fresh(['student', 'admin']),
-            'qr_code' => $qrCode,
-            'action' => $isEditedDevice ? 'changes_approved' : 'approved'
-        ]);
+            'message' => 'Database error occurred while approving the device.',
+            'error' => $e->getMessage()
+        ], 500);
     }
+}
+
+    // /**
+    //  * Approve a device
+    //  */
+    // public function approve($id)
+    // {
+    //     // CHANGED: Use 'laptop_id' for findOrFail if that is the model's primary key
+    //     $device = Device::findOrFail($id); 
+    //     $user = Auth::user();
+        
+    //     // --- Admin Check ---
+    //     $isAdmin = false;
+    //     if (isset($user->course)) {
+    //         $isAdmin = strtolower($user->course) === 'admin';
+    //     }
+    //     if (!$isAdmin && isset($user->email)) {
+    //         $isAdmin = str_contains(strtolower($user->email), 'admin@devpass');
+    //     }
+        
+    //     if (!$isAdmin) {
+    //         return response()->json(['message' => 'Unauthorized. Admin access required.'], 403);
+    //     }
+        
+    //     // Get admin ID from admins table
+    //     // NOTE: This logic assumes the authenticated $user object (Student model) has an 'email'
+    //     // and that an Admin record exists with that email and has an 'admin_id' primary key.
+    //     $adminId = null;
+    //     if (isset($user->email)) {
+    //         $admin = \App\Models\Admin::where('email', $user->email)->first();
+    //         if ($admin) {
+    //             $adminId = $admin->admin_id; // Match the foreign key 'approved_by' in devices table
+    //         }
+    //     }
+        
+    //     // Fallback or error handling if adminId is not found might be needed here
+    //     // For simplicity, we proceed with potentially null if user isn't found in Admin model
+        
+    //     // Check if this is a renewal request
+    //     $isRenewalRequest = $device->last_action === 'renewal_requested';
+        
+    //     if ($isRenewalRequest) {
+    //         // Handle renewal approval
+    //         return $this->approveRenewal($id);
+    //     }
+        
+    //     // Check if this is an edited device (has original_values and approved_at)
+    //     $isEditedDevice = $device->original_values !== null && $device->approved_at !== null;
+        
+    //     $device->registration_status = 'active';
+    //     $device->approved_by = $adminId;
+    //     $device->approved_at = Carbon::now(config('app.timezone'));
+        
+    //     // Clear original values since changes are now approved
+    //     $device->original_values = null;
+    //     $device->last_action = $isEditedDevice ? 'changes_approved' : 'approved';
+    //     $device->save();
+        
+    //     // Create QR code for the device (or reactivate existing if it's an edited device)
+    //     if ($isEditedDevice) {
+    //         // For edited devices, reactivate the latest QR code if it exists and is not expired
+    //         $latestQR = $device->qrCodes()->latest('expires_at')->first();
+    //         if ($latestQR && $latestQR->expires_at && $latestQR->expires_at->isFuture()) {
+    //             $latestQR->is_active = true;
+    //             $latestQR->save();
+    //             $qrCode = $latestQR;
+    //         } else {
+    //             // Create new QR code if none exists or all are expired
+    //             $qrCode = $this->qrCodeService->createQRCode([
+    //                 'laptop_id' => $device->laptop_id, 
+    //                 'expires_at' => Carbon::now(config('app.timezone'))->addMonth(),
+    //                 'is_active' => true,
+    //             ]);
+    //         }
+    //     } else {
+    //         // New device - create new QR code
+    //         $qrCode = $this->qrCodeService->createQRCode([
+    //             'laptop_id' => $device->laptop_id, 
+    //                 'expires_at' => Carbon::now(config('app.timezone'))->addMonth(),
+    //             'is_active' => true,
+    //         ]);
+    //     }
+        
+    //     return response()->json([
+    //         'message' => 'Device approved successfully',
+    //         'device' => $device->fresh(['student', 'admin']),
+    //         'qr_code' => $qrCode,
+    //         'action' => $isEditedDevice ? 'changes_approved' : 'approved'
+    //     ]);
+    // }
 
     /**
      * Reject a device (revert changes if it was an edit, or reject if new registration)
@@ -464,17 +407,23 @@ class DeviceController extends Controller
             ], 422);
         }
         
-        // Check for duplicate serial number across ALL students (serial numbers must be globally unique)
+        // Check for duplicate serial number across ALL records to respect the DB UNIQUE constraint
         if (!empty($validated['serial_number'])) {
-            $existingDevice = Device::where('serial_number', $validated['serial_number'])
-                ->whereIn('registration_status', ['active', 'pending'])
+            // Use withTrashed() to check deleted records, and remove the status filter
+            $existingDevice = Device::withTrashed()
+                ->where('serial_number', $validated['serial_number'])
                 ->first();
             
             if ($existingDevice) {
+                // Generate a smart error message so the user knows exactly WHY it's failing
+                $statusContext = $existingDevice->trashed() 
+                    ? 'was previously deleted from the system' 
+                    : "is currently marked as '{$existingDevice->registration_status}'";
+
                 return response()->json([
-                    'message' => 'A device with this serial number already exists. Serial numbers must be unique across all students. Please use a different serial number.',
+                    'message' => "A device with this serial number already exists and $statusContext. Please contact an administrator to restore or update the existing record.",
                     'errors' => [
-                        'serial_number' => ['A device with this serial number already exists. Serial numbers must be unique across all students.']
+                        'serial_numjber' => ["This serial number is already registered in the database ($statusContext)."]
                     ]
                 ], 422);
             }
