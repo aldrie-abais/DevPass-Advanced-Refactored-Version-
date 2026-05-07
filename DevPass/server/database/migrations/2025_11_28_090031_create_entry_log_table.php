@@ -11,7 +11,7 @@ return new class extends Migration
      */
     public function up(): void
     {
-        // Only create if entry_log table doesn't exist
+        
         if (!Schema::hasTable('entry_log')) {
             Schema::create('entry_log', function (Blueprint $table) {
                 $table->id('log_id');
